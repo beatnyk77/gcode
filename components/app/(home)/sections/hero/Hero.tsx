@@ -15,7 +15,7 @@ export default function HomeHero() {
   return (
     <section className="overflow-x-clip" id="home-hero">
       <div
-        className="pt-28 lg:pt-254 lg:-mt-100 pb-115 relative"
+        className="pt-28 lg:pt-254 lg:-mt-100 pb-115 relative bg-gradient-to-br from-orange-50 via-orange-50/50 to-blue-50"
         id="hero-content"
       >
         <HomeHeroPixi />
@@ -30,16 +30,7 @@ export default function HomeHero() {
           <HomeHeroTitle />
 
           <p className="text-center text-body-large">
-            Power your AI apps with clean data crawled
-            <br className="lg-max:hidden" />
-            from any website.
-            <Link
-              className="bg-black-alpha-4 hover:bg-black-alpha-6 lg:ml-4 rounded-6 px-8 lg:px-6 text-label-large lg-max:py-2 h-30 lg:h-24 block lg-max:mt-8 lg-max:mx-auto lg-max:w-max lg:inline-block gap-4 transition-all"
-              href="https://github.com/firecrawl/firecrawl"
-              target="_blank"
-            >
-              It&apos;s also open source.
-            </Link>
+            Build, deploy, and iterate on web apps with AI.
           </p>
         </div>
       </div>

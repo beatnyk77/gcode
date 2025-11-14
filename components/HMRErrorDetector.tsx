@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 
 interface HMRErrorDetectorProps {
   iframeRef: React.RefObject<HTMLIFrameElement>;
-  onErrorDetected: (errors: Array<{ type: string; message: string; package?: string }>) => void;
+  onErrorDetected: (errors: Array<{ type: string; message: string; package?: string; stack?: string }>) => void;
 }
 
 export default function HMRErrorDetector({ iframeRef, onErrorDetected }: HMRErrorDetectorProps) {
@@ -21,8 +21,10 @@ export default function HMRErrorDetector({ iframeRef, onErrorDetected }: HMRErro
         if (errorOverlay) {
           // Try to extract error message
           const messageElement = errorOverlay.shadowRoot?.querySelector('.message-body');
+          const stackElement = errorOverlay.shadowRoot?.querySelector('.stack-trace');
           if (messageElement) {
             const errorText = messageElement.textContent || '';
+            const stackText = stackElement ? (stackElement.textContent || '') : undefined;
             
             // Parse import errors
             const importMatch = errorText.match(/Failed to resolve import "([^"]+)"/);
@@ -41,9 +43,18 @@ export default function HMRErrorDetector({ iframeRef, onErrorDetected }: HMRErro
                 onErrorDetected([{
                   type: 'npm-missing',
                   message: `Failed to resolve import "${packageName}"`,
-                  package: finalPackage
+                  package: finalPackage,
+                  stack: stackText
                 }]);
               }
+            }
+            // Generic JS error fallback
+            if (!importMatch && errorText) {
+              onErrorDetected([{
+                type: 'runtime-error',
+                message: errorText,
+                stack: stackText
+              }]);
             }
           }
         }

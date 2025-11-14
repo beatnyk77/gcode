@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
+import dynamic from 'next/dynamic';
 import { appConfig } from '@/config/app.config';
 import HeroInput from '@/components/HeroInput';
 import SidebarInput from '@/components/app/generation/SidebarInput';
@@ -24,6 +25,8 @@ import {
 } from '@/lib/icons';
 import { motion } from 'framer-motion';
 import CodeApplicationProgress, { type CodeApplicationState } from '@/components/CodeApplicationProgress';
+import { useSandboxErrorsStore } from '@/lib/store/sandbox-errors';
+import type { ErrorCapture } from '@/types/debug';
 
 interface SandboxData {
   sandboxId: string;
@@ -45,6 +48,7 @@ interface ChatMessage {
 }
 
 function AISandboxPage() {
+  const EditorPane = dynamic(() => import('@/components/EditorPane'), { ssr: false });
   const [sandboxData, setSandboxData] = useState<SandboxData | null>(null);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState({ text: 'Not connected', active: false });
@@ -109,6 +113,9 @@ function AISandboxPage() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const chatMessagesRef = useRef<HTMLDivElement>(null);
   const codeDisplayRef = useRef<HTMLDivElement>(null);
+  
+  // Sandbox error handling
+  const { addError } = useSandboxErrorsStore();
   
   const [codeApplicationState, setCodeApplicationState] = useState<CodeApplicationState>({
     stage: null
@@ -328,6 +335,78 @@ function AISandboxPage() {
     }
   }, [showHomeScreen, homeUrlInput]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Set up sandbox error handling
+  useEffect(() => {
+    // Listen for custom sandbox-error events
+    const handleSandboxError = (event: Event) => {
+      const customEvent = event as CustomEvent<ErrorCapture>;
+      if (customEvent.detail) {
+        addError(customEvent.detail);
+        console.error('[Sandbox Error]', customEvent.detail);
+      }
+    };
+
+    window.addEventListener('sandbox-error', handleSandboxError);
+
+    return () => {
+      window.removeEventListener('sandbox-error', handleSandboxError);
+    };
+  }, [addError]);
+
+  // Set up iframe error handling
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+
+    const handleIframeError = (event: ErrorEvent) => {
+      // Try to extract error information
+      const error: ErrorCapture = {
+        message: event.message || 'Unknown iframe error',
+        stack: event.error?.stack || '',
+        file: event.filename || 'iframe',
+        line: event.lineno || 0
+      };
+
+      addError(error);
+      console.error('[Iframe Error]', error);
+    };
+
+    // Add error listener to iframe
+    iframe.addEventListener('error', handleIframeError as EventListener);
+
+    // Also try to capture errors from iframe's contentWindow if accessible
+    // Note: This may fail due to cross-origin restrictions
+    try {
+      const iframeWindow = iframe.contentWindow;
+      if (iframeWindow) {
+        const originalOnError = iframeWindow.onerror;
+        iframeWindow.onerror = function(message, source, lineno, colno, error) {
+          const errorCapture: ErrorCapture = {
+            message: typeof message === 'string' ? message : String(message),
+            stack: error?.stack || '',
+            file: source || 'iframe-content',
+            line: lineno || 0
+          };
+
+          addError(errorCapture);
+          console.error('[Iframe Content Error]', errorCapture);
+
+          // Call original handler if it exists
+          if (originalOnError) {
+            return originalOnError.call(this, message, source, lineno, colno, error);
+          }
+          return false;
+        };
+      }
+    } catch (e) {
+      // Cross-origin restrictions - this is expected for E2B sandboxes
+      console.log('[Sandbox] Cannot access iframe contentWindow due to cross-origin restrictions');
+    }
+
+    return () => {
+      iframe.removeEventListener('error', handleIframeError as EventListener);
+    };
+  }, [addError, sandboxData?.url]);
 
   useEffect(() => {
     // Only check sandbox status on mount if we don't already have sandboxData
@@ -1584,6 +1663,16 @@ Tip: I automatically detect and install npm packages from your code imports (lik
               title="Open Lovable Sandbox"
               allow="clipboard-write"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+              onError={(e) => {
+                const error: ErrorCapture = {
+                  message: 'Iframe load error',
+                  stack: '',
+                  file: sandboxData.url || 'unknown',
+                  line: 0
+                };
+                addError(error);
+                console.error('[Iframe Load Error]', error, e);
+              }}
             />
             
             {/* Package installation overlay - shows when installing packages or applying code */}
@@ -2175,6 +2264,69 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     } catch (error: any) {
       log(`Failed to create zip: ${error.message}`, 'error');
       addChatMessage(`Failed to create ZIP: ${error.message}`, 'system');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deployToVercel = async () => {
+    if (!sandboxData) {
+      addChatMessage('Please wait for the sandbox to be created before deploying.', 'system');
+      return;
+    }
+    
+    setLoading(true);
+    log('Preparing deployment...');
+    addChatMessage('Creating ZIP and deploying to Vercel...', 'system');
+    
+    try {
+      // First, create the ZIP
+      const zipResponse = await fetch('/api/create-zip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+      const zipData = await zipResponse.json();
+      
+      if (!zipData.success) {
+        throw new Error(zipData.error || 'Failed to create ZIP');
+      }
+
+      // Get project name from user or use default
+      const projectName = prompt('Enter project name (optional):') || undefined;
+      const githubRepo = prompt('Enter GitHub repo (owner/repo, optional):') || undefined;
+
+      // Deploy to Vercel
+      const deployResponse = await fetch('/api/deploy-vercel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          zipDataUrl: zipData.dataUrl,
+          projectName,
+          githubRepo,
+        })
+      });
+      
+      const deployData = await deployResponse.json();
+      
+      if (deployData.success) {
+        log('Deployed to Vercel!');
+        const message = `Deployment successful!\n\n` +
+          `🌐 Live URL: ${deployData.deployment.url}\n` +
+          (deployData.githubUrl ? `📦 GitHub: ${deployData.githubUrl}\n` : '') +
+          `\nYour app is now live on Vercel!`;
+        addChatMessage(message, 'system');
+        
+        // Open deployment URL in new tab
+        if (deployData.deployment.url) {
+          window.open(deployData.deployment.url, '_blank');
+        }
+      } else {
+        throw new Error(deployData.error || 'Deployment failed');
+      }
+    } catch (error: any) {
+      log(`Failed to deploy: ${error.message}`, 'error');
+      addChatMessage(`Failed to deploy to Vercel: ${error.message}`, 'system');
     } finally {
       setLoading(false);
     }
@@ -3126,6 +3278,18 @@ Focus on the key sections and content, making it clean and modern.`;
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
             </svg>
           </button>
+          <button 
+            onClick={deployToVercel}
+            disabled={!sandboxData || loading}
+            className="p-8 rounded-lg transition-colors bg-orange-500 border border-orange-600 text-white hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Deploy to Vercel"
+            aria-label="Deploy project to Vercel"
+            aria-busy={loading}
+          >
+            <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+            </svg>
+          </button>
        
         </div>
       </div>
@@ -3437,88 +3601,9 @@ Focus on the key sections and content, making it clean and modern.`;
           </div>
         </div>
 
-        {/* Right Panel - Preview or Generation (2/3 of remaining width) */}
+        {/* Right Panel - Monaco Editor & Preview */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="px-3 pt-4 pb-4 bg-white border-b border-gray-200 flex justify-between items-center">
-            <div className="flex items-center gap-2">
-              {/* Toggle-style Code/View switcher */}
-              <div className="inline-flex bg-gray-100 border border-gray-200 rounded-md p-0.5">
-                <button
-                  onClick={() => setActiveTab('generation')}
-                  className={`px-3 py-1 rounded transition-all text-xs font-medium ${
-                    activeTab === 'generation' 
-                      ? 'bg-white text-gray-900 shadow-sm' 
-                      : 'bg-transparent text-gray-600 hover:text-gray-900'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5">
-                    <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
-                    </svg>
-                    <span>Code</span>
-                  </div>
-                </button>
-                <button
-                  onClick={() => setActiveTab('preview')}
-                  className={`px-3 py-1 rounded transition-all text-xs font-medium ${
-                    activeTab === 'preview' 
-                      ? 'bg-white text-gray-900 shadow-sm' 
-                      : 'bg-transparent text-gray-600 hover:text-gray-900'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5">
-                    <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                    </svg>
-                    <span>View</span>
-                  </div>
-                </button>
-              </div>
-            </div>
-            <div className="flex gap-2 items-center">
-              {/* Files generated count */}
-              {activeTab === 'generation' && !generationProgress.isEdit && generationProgress.files.length > 0 && (
-                <div className="text-gray-500 text-xs font-medium">
-                  {generationProgress.files.length} files generated
-                </div>
-              )}
-              
-              {/* Live Code Generation Status */}
-              {activeTab === 'generation' && generationProgress.isGenerating && (
-                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-gray-100 border border-gray-200 rounded-md text-xs font-medium text-gray-700">
-                  <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
-                  {generationProgress.isEdit ? 'Editing code' : 'Live generation'}
-                </div>
-              )}
-              
-              {/* Sandbox Status Indicator */}
-              {sandboxData && (
-                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-gray-100 border border-gray-200 rounded-md text-xs font-medium text-gray-700">
-                  <div className="w-1.5 h-1.5 bg-green-500 rounded-full" />
-                  Sandbox active
-                </div>
-              )}
-              
-              {/* Open in new tab button */}
-              {sandboxData && (
-                <a 
-                  href={sandboxData.url} 
-                  target="_blank" 
-                  rel="noopener noreferrer"
-                  title="Open in new tab"
-                  className="p-1.5 rounded-md transition-all text-gray-600 hover:text-gray-900 hover:bg-gray-100"
-                >
-                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                  </svg>
-                </a>
-              )}
-            </div>
-          </div>
-          <div className="flex-1 relative overflow-hidden">
-            {renderMainContent()}
-          </div>
+          <EditorPane />
         </div>
       </div>
 

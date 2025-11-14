@@ -256,8 +256,8 @@ export const encryptText = (
 
 export default function HomeHeroTitle() {
   return (
-    <h1 className="text-title-h1 mx-auto text-center [&_span]:text-heat-100 mb-12 lg:mb-16">
-     Open Lovable <span>v2</span>
+    <h1 className="text-title-h1 mx-auto text-center mb-12 lg:mb-16 bg-gradient-to-r from-orange-500 via-orange-400 to-blue-500 bg-clip-text text-transparent">
+     gcode.dev
     </h1>
   );
 }

@@ -26,7 +26,8 @@ import HeaderBrandKit from "@/components/shared/header/BrandKit/BrandKit";
 import HeaderWrapper from "@/components/shared/header/Wrapper/Wrapper";
 import HeaderDropdownWrapper from "@/components/shared/header/Dropdown/Wrapper/Wrapper";
 import GithubIcon from "@/components/shared/header/Github/_svg/GithubIcon";
-import ButtonUI from "@/components/ui/shadcn/button"
+import ButtonUI from "@/components/ui/shadcn/button";
+import Footer from "@/components/shared/footer/Footer";
 
 interface SearchResult {
   url: string;
@@ -234,7 +235,7 @@ export default function HomePage() {
 
         {/* Hero Section */}
         <section className="overflow-x-clip" id="home-hero">
-          <div className="pt-28 lg:pt-254 lg:-mt-100 pb-115 relative" id="hero-content">
+          <div className="pt-28 lg:pt-254 lg:-mt-100 pb-115 relative bg-gradient-to-br from-orange-50 via-orange-50/50 to-blue-50" id="hero-content">
             <HomeHeroPixi />
             <HeroFlame />
             <BackgroundOuterPiece />
@@ -244,15 +245,8 @@ export default function HomePage() {
               <HomeHeroBadge />
               <HomeHeroTitle />
               <p className="text-center text-body-large">
-                Re-imagine any website, in seconds.
+                Build, deploy, and iterate on web apps with AI.
               </p>
-              <Link
-                className="bg-black-alpha-4 hover:bg-black-alpha-6 rounded-6 px-8 lg:px-6 text-label-large h-30 lg:h-24 block mt-8 mx-auto w-max gap-4 transition-all"
-                href="#"
-                onClick={(e) => e.preventDefault()}
-              >
-                Powered by Firecrawl.
-              </Link>
             </div>
           </div>
 
@@ -801,6 +795,8 @@ export default function HomePage() {
           animation: shimmer 2s infinite;
         }
       `}</style>
+      
+      <Footer />
     </HeaderProvider>
   );
 }

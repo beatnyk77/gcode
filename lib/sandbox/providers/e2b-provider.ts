@@ -2,9 +2,11 @@ import { Sandbox } from '@e2b/code-interpreter';
 import { SandboxProvider, SandboxInfo, CommandResult } from '../types';
 // SandboxProviderConfig available through parent class
 import { appConfig } from '@/config/app.config';
+import type { ErrorCapture } from '@/types/debug';
 
 export class E2BProvider extends SandboxProvider {
   private existingFiles: Set<string> = new Set();
+  private errorHandler?: (error: ErrorCapture) => void;
 
   /**
    * Attempt to reconnect to an existing E2B sandbox
@@ -62,6 +64,9 @@ export class E2BProvider extends SandboxProvider {
         this.sandbox.setTimeout(appConfig.e2b.timeoutMs);
       }
 
+      // Set up error handler if available
+      this.setupErrorHandling();
+
       return this.sandboxInfo;
 
     } catch (error) {
@@ -75,34 +80,65 @@ export class E2BProvider extends SandboxProvider {
       throw new Error('No active sandbox');
     }
 
-    
-    const result = await this.sandbox.runCode(`
-      import subprocess
-      import os
+    try {
+      const result = await this.sandbox.runCode(`
+        import subprocess
+        import os
+        import traceback
 
-      os.chdir('/home/user/app')
-      result = subprocess.run(${JSON.stringify(command.split(' '))}, 
-                            capture_output=True, 
-                            text=True, 
-                            shell=False)
+        os.chdir('/home/user/app')
+        try:
+            result = subprocess.run(${JSON.stringify(command.split(' '))}, 
+                                  capture_output=True, 
+                                  text=True, 
+                                  shell=False)
 
-      print("STDOUT:")
-      print(result.stdout)
-      if result.stderr:
-          print("\\nSTDERR:")
-          print(result.stderr)
-      print(f"\\nReturn code: {result.returncode}")
-    `);
-    
-    const output = result.logs.stdout.join('\n');
-    const stderr = result.logs.stderr.join('\n');
-    
-    return {
-      stdout: output,
-      stderr,
-      exitCode: result.error ? 1 : 0,
-      success: !result.error
-    };
+            print("STDOUT:")
+            print(result.stdout)
+            if result.stderr:
+                print("\\nSTDERR:")
+                print(result.stderr)
+            print(f"\\nReturn code: {result.returncode}")
+        except Exception as e:
+            print(f"\\nERROR: {str(e)}")
+            traceback.print_exc()
+            raise
+      `);
+      
+      const output = result.logs.stdout.join('\n');
+      const stderr = result.logs.stderr.join('\n');
+      
+      // Capture errors from stderr or error logs
+      if (result.error || stderr) {
+        const errorMessage = result.error?.message || stderr || 'Unknown error';
+        const errorStack = result.error?.stack || result.logs.stderr.join('\n') || '';
+        
+        this.captureError({
+          message: errorMessage,
+          stack: errorStack,
+          file: 'command-execution',
+          line: 0
+        });
+      }
+      
+      return {
+        stdout: output,
+        stderr,
+        exitCode: result.error ? 1 : 0,
+        success: !result.error
+      };
+    } catch (error) {
+      // Capture exception errors
+      const err = error as Error;
+      this.captureError({
+        message: err.message || String(error),
+        stack: err.stack || '',
+        file: 'e2b-provider',
+        line: 0
+      });
+      
+      throw error;
+    }
   }
 
   async writeFile(path: string, content: string): Promise<void> {
@@ -509,4 +545,51 @@ print(f'✓ Vite restarted with PID: {process.pid}')
   isAlive(): boolean {
     return !!this.sandbox;
   }
-}
+
+  /**
+   * Set up error handling for the sandbox
+   */
+  private setupErrorHandling(): void {
+    if (!this.sandbox) return;
+
+    // Set up error handler for E2B sandbox
+    // E2B sandbox may emit errors through various channels
+    // We'll capture errors from runCode results and also listen for error events if available
+    
+    // Check if sandbox has error event listeners
+    if (typeof (this.sandbox as any).on === 'function') {
+      (this.sandbox as any).on('error', (error: any) => {
+        this.captureError({
+          message: error?.message || String(error),
+          stack: error?.stack || '',
+          file: error?.file || 'unknown',
+          line: error?.line || 0
+        });
+      });
+    }
+  }
+
+  /**
+   * Set error handler callback
+   */
+  setErrorHandler(handler: (error: ErrorCapture) => void): void {
+    this.errorHandler = handler;
+  }
+
+  /**
+   * Capture and emit error
+   */
+  private captureError(error: ErrorCapture): void {
+    if (this.errorHandler) {
+      this.errorHandler(error);
+    }
+
+    // Also dispatch custom event
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('sandbox-error', {
+          detail: error
+        })
+      );
+    }
+  }

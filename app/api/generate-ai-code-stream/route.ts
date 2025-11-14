@@ -10,6 +10,7 @@ import { executeSearchPlan, formatSearchResultsForAI, selectTargetFile } from '@
 import { FileManifest } from '@/types/file-manifest';
 import type { ConversationState, ConversationMessage, ConversationEdit } from '@/types/conversation';
 import { appConfig } from '@/config/app.config';
+import { callGrok, RateLimitError } from '@/lib/clients/grok';
 
 // Force dynamic route to enable streaming
 export const dynamic = 'force-dynamic';
@@ -1216,6 +1217,7 @@ MORPH FAST APPLY MODE (EDIT-ONLY):
         const isAnthropic = model.startsWith('anthropic/');
         const isGoogle = model.startsWith('google/');
         const isOpenAI = model.startsWith('openai/');
+        const isGrok = model === 'grok';
         const isKimiGroq = model === 'moonshotai/kimi-k2-instruct-0905';
         const modelProvider = isAnthropic ? anthropic : 
                               (isOpenAI ? openai : 
@@ -1238,18 +1240,13 @@ MORPH FAST APPLY MODE (EDIT-ONLY):
           actualModel = model;
         }
 
-        console.log(`[generate-ai-code-stream] Using provider: ${isAnthropic ? 'Anthropic' : isGoogle ? 'Google' : isOpenAI ? 'OpenAI' : 'Groq'}, model: ${actualModel}`);
+        console.log(`[generate-ai-code-stream] Using provider: ${isGrok ? 'Grok (xAI)' : (isAnthropic ? 'Anthropic' : isGoogle ? 'Google' : isOpenAI ? 'OpenAI' : 'Groq')}, model: ${actualModel}`);
         console.log(`[generate-ai-code-stream] AI Gateway enabled: ${isUsingAIGateway}`);
         console.log(`[generate-ai-code-stream] Model string: ${model}`);
 
-        // Make streaming API call with appropriate provider
-        const streamOptions: any = {
-          model: modelProvider(actualModel),
-          messages: [
-            { 
-              role: 'system', 
-              content: systemPrompt + `
-
+        // Prepare prompts (used by both standard providers and Grok)
+        const systemPreamble = systemPrompt + `
+              
 🚨 CRITICAL CODE GENERATION RULES - VIOLATION = FAILURE 🚨:
 1. NEVER truncate ANY code - ALWAYS write COMPLETE files
 2. NEVER use "..." anywhere in your code - this causes syntax errors
@@ -1282,11 +1279,8 @@ Examples of CORRECT CODE (ALWAYS DO THIS):
 ✅ const title = "Welcome to our application"
 ✅ import { useState, useEffect, useCallback } from 'react'
 
-REMEMBER: It's better to generate fewer COMPLETE files than many INCOMPLETE files.`
-            },
-            { 
-              role: 'user', 
-              content: fullPrompt + `
+REMEMBER: It's better to generate fewer COMPLETE files than many INCOMPLETE files.`;
+        const userPreamble = fullPrompt + `
 
 CRITICAL: You MUST complete EVERY file you start. If you write:
 <file path="src/components/Hero.jsx">
@@ -1302,36 +1296,40 @@ ALWAYS write complete code:
 <p>Some text here with full content</p>  ✅ CORRECT
 
 If you're running out of space, generate FEWER files but make them COMPLETE.
-It's better to have 3 complete files than 10 incomplete files.`
-            }
-          ],
-          maxTokens: 8192, // Reduce to ensure completion
-          stopSequences: [] // Don't stop early
-          // Note: Neither Groq nor Anthropic models support tool/function calling in this context
-          // We use XML tags for package detection instead
-        };
-        
-        // Add temperature for non-reasoning models
-        if (!model.startsWith('openai/gpt-5')) {
-          streamOptions.temperature = 0.7;
-        }
-        
-        // Add reasoning effort for GPT-5 models
-        if (isOpenAI) {
-          streamOptions.experimental_providerMetadata = {
-            openai: {
-              reasoningEffort: 'high'
-            }
-          };
-        }
-        
-        let result;
+It's better to have 3 complete files than 10 incomplete files.`;
+
+        // Make streaming API call with appropriate provider
+        let result: any;
         let retryCount = 0;
         const maxRetries = 2;
         
         while (retryCount <= maxRetries) {
           try {
-            result = await streamText(streamOptions);
+            if (isGrok) {
+              // For Grok, we embed the system content into the single prompt as per client contract
+              const grokPrompt = `SYSTEM:\n${systemPreamble}\n\nUSER:\n${userPreamble}`;
+              // Default to grok-4; could be made configurable later
+              result = callGrok('grok-4', grokPrompt);
+            } else {
+              const streamOptions: any = {
+                model: modelProvider(actualModel),
+                messages: [
+                  { role: 'system', content: systemPreamble },
+                  { role: 'user', content: userPreamble }
+                ],
+                maxTokens: 8192,
+                stopSequences: []
+              };
+              if (!model.startsWith('openai/gpt-5')) {
+                streamOptions.temperature = 0.7;
+              }
+              if (isOpenAI) {
+                streamOptions.experimental_providerMetadata = {
+                  openai: { reasoningEffort: 'high' }
+                };
+              }
+              result = await streamText(streamOptions);
+            }
             break; // Success, exit retry loop
           } catch (streamError: any) {
             console.error(`[generate-ai-code-stream] Error calling streamText (attempt ${retryCount + 1}/${maxRetries + 1}):`, streamError);
@@ -1341,8 +1339,9 @@ It's better to have 3 complete files than 10 incomplete files.`
             const isRetryableError = streamError.message?.includes('Service unavailable') || 
                                     streamError.message?.includes('rate limit') ||
                                     streamError.message?.includes('timeout');
+            const isGrokRateLimit = streamError instanceof RateLimitError;
             
-            if (retryCount < maxRetries && isRetryableError) {
+            if (retryCount < maxRetries && (isRetryableError || isGrokRateLimit)) {
               retryCount++;
               console.log(`[generate-ai-code-stream] Retrying in ${retryCount * 2} seconds...`);
               
@@ -1353,7 +1352,10 @@ It's better to have 3 complete files than 10 incomplete files.`
               });
               
               // Wait before retry with exponential backoff
-              await new Promise(resolve => setTimeout(resolve, retryCount * 2000));
+              const backoff = isGrokRateLimit && (streamError as RateLimitError).retryAfterMs
+                ? Math.max((streamError as RateLimitError).retryAfterMs!, retryCount * 2000)
+                : retryCount * 2000;
+              await new Promise(resolve => setTimeout(resolve, backoff));
               
               // If Groq fails, try switching to a fallback model
               if (isGroqServiceError && retryCount === maxRetries) {
@@ -1365,7 +1367,7 @@ It's better to have 3 complete files than 10 incomplete files.`
               // Final error, send to user
               await sendProgress({ 
                 type: 'error', 
-                message: `Failed to initialize ${isGoogle ? 'Gemini' : isAnthropic ? 'Claude' : isOpenAI ? 'GPT-5' : isKimiGroq ? 'Kimi (Groq)' : 'Groq'} streaming: ${streamError.message}` 
+                message: `Failed to initialize ${isGrok ? 'Grok' : (isGoogle ? 'Gemini' : isAnthropic ? 'Claude' : isOpenAI ? 'GPT-5' : isKimiGroq ? 'Kimi (Groq)' : 'Groq')} streaming: ${streamError.message}` 
               });
               
               // If this is a Google model error, provide helpful info
@@ -1394,7 +1396,119 @@ It's better to have 3 complete files than 10 incomplete files.`
         let tagBuffer = '';
         
         // Stream the response and parse for packages in real-time
-        for await (const textPart of result?.textStream || []) {
+        if (isGrok) {
+          for await (const evt of result as AsyncGenerator<any>) {
+            if (evt.type === 'text' && typeof evt.text === 'string') {
+              const text = evt.text;
+              generatedCode += text;
+              currentFile += text;
+              
+              // Combine with buffer for tag detection
+              const searchText = tagBuffer + text;
+              
+              // Log streaming chunks to console
+              process.stdout.write(text);
+              
+              // Check if we're entering or leaving a tag
+              const hasOpenTag = /<(file|package|packages|explanation|command|structure|template)\b/.test(text);
+              const hasCloseTag = /<\/(file|package|packages|explanation|command|structure|template)>/.test(text);
+              
+              if (hasOpenTag) {
+                // Send any buffered conversational text before the tag
+                if (conversationalBuffer.trim() && !isInTag) {
+                  await sendProgress({ 
+                    type: 'conversation', 
+                    text: conversationalBuffer.trim()
+                  });
+                  conversationalBuffer = '';
+                }
+                isInTag = true;
+              }
+              
+              if (hasCloseTag) {
+                isInTag = false;
+              }
+              
+              // If we're not in a tag, buffer as conversational text
+              if (!isInTag && !hasOpenTag) {
+                conversationalBuffer += text;
+              }
+              
+              // Stream the raw text for live preview
+              await sendProgress({ 
+                type: 'stream', 
+                text: text,
+                raw: true 
+              });
+              
+              // Debug: Log every 100 characters streamed
+              if (generatedCode.length % 100 < text.length) {
+                console.log(`[generate-ai-code-stream] Streamed ${generatedCode.length} chars`);
+              }
+              
+              // Check for package tags in buffered text (ONLY for edits, not initial generation)
+              let lastIndex = 0;
+              if (isEdit) {
+                const packageRegex = /<package>([^<]+)<\/package>/g;
+                let packageMatch;
+                
+                while ((packageMatch = packageRegex.exec(searchText)) !== null) {
+                  const packageName = packageMatch[1].trim();
+                  if (packageName && !packagesToInstall.includes(packageName)) {
+                    packagesToInstall.push(packageName);
+                    console.log(`[generate-ai-code-stream] Package detected: ${packageName}`);
+                    await sendProgress({ 
+                      type: 'package', 
+                      name: packageName,
+                      message: `Package detected: ${packageName}`
+                    });
+                  }
+                  lastIndex = packageMatch.index + packageMatch[0].length;
+                }
+              }
+              
+              // Keep unmatched portion in buffer for next iteration
+              tagBuffer = searchText.substring(Math.max(0, lastIndex - 50)); // Keep last 50 chars
+              
+              // Check for file boundaries
+              if (text.includes('<file path="')) {
+                const pathMatch = text.match(/<file path="([^"]+)"/);
+                if (pathMatch) {
+                  currentFilePath = pathMatch[1];
+                  isInFile = true;
+                  currentFile = text;
+                }
+              }
+              
+              // Check for file end
+              if (isInFile && currentFile.includes('</file>')) {
+                isInFile = false;
+                
+                // Send component progress update
+                if (currentFilePath.includes('components/')) {
+                  componentCount++;
+                  const componentName = currentFilePath.split('/').pop()?.replace('.jsx', '') || 'Component';
+                  await sendProgress({ 
+                    type: 'component', 
+                    name: componentName,
+                    path: currentFilePath,
+                    index: componentCount
+                  });
+                } else if (currentFilePath.includes('App.jsx')) {
+                  await sendProgress({ 
+                    type: 'app', 
+                    message: 'Generated main App.jsx',
+                    path: currentFilePath
+                  });
+                }
+                
+                currentFile = '';
+                currentFilePath = '';
+              }
+            }
+          }
+        } else {
+          for await (const textPart of result?.textStream || []) {
           const text = textPart || '';
           generatedCode += text;
           currentFile += text;
@@ -1501,6 +1615,7 @@ It's better to have 3 complete files than 10 incomplete files.`
             currentFile = '';
             currentFilePath = '';
           }
+        }
         }
         
         console.log('\n\n[generate-ai-code-stream] Streaming complete.');
